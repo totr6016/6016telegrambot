@@ -28,7 +28,7 @@ if not BOT_TOKEN:
 if not ONEDRIVE_SHARE_URL:
     raise ValueError("ONEDRIVE_SHARE_URL environment variable is required")
 
-CACHE_TTL = 120  # секунд — как часто обновлять файл из OneDrive
+CACHE_TTL = 60  # секунд — как часто обновлять файл из OneDrive
 _cache: dict = {"result": None, "ts": 0.0}
 
 # Внутренние имена колонок после нормализации
@@ -171,7 +171,8 @@ def normalize_sheet(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame | None:
             rename[col] = COL_SENT
         elif ("НАЗВАНИЕ" in u or "品名" in col) and COL_DESC not in rename.values():
             rename[col] = COL_DESC
-        elif ("ИМЯ" in u or "НОМЕР" in u or "收件人" in col) and COL_CLIENT not in rename.values():
+        elif ("ПОЛУЧАТЕЛ" in u or "ИМЯ" in u or "КЛИЕНТ" in u or "收件人" in col) and COL_CLIENT not in rename.values():
+            # Приоритет: ПОЛУЧАТЕЛЬ / ИМЯ / КЛИЕНТ — не путаем с номером заказа
             rename[col] = COL_CLIENT
         elif ("ПУНКТ" in u or "目的地" in col) and COL_CLIENT not in rename.values():
             rename[col] = COL_CLIENT
@@ -184,8 +185,16 @@ def normalize_sheet(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame | None:
 
     df = df.rename(columns=rename)
 
-    # Нормализуем трек-коды: убираем пробелы и табуляции, переводим в верхний регистр
-    df[COL_TRACKING] = df[COL_TRACKING].astype(str).str.strip().str.upper()
+    # Нормализуем трек-коды: убираем пробелы, переводим в верхний регистр.
+    # Числовые коды pandas читает как float (1234567.0) — убираем дробную часть.
+    def _norm_track(val) -> str:
+        s = str(val).strip()
+        # "1234567890.0" → "1234567890"
+        if s.endswith(".0") and s[:-2].isdigit():
+            s = s[:-2]
+        return s.upper()
+
+    df[COL_TRACKING] = df[COL_TRACKING].apply(_norm_track)
 
     # Убираем пустые строки (где трек-код пустой или nan)
     df = df[~df[COL_TRACKING].isin(["", "NAN", "NONE"])]
@@ -288,8 +297,14 @@ def find_order(code: str):
       'detained'           — задержана на авиа-складе, ещё не в карго
     """
     df, green_tracks = load_orders()
+    # Нормализуем введённый код: верхний регистр, убираем пробелы и ".0"
     code = code.strip().upper()
+    if code.endswith(".0") and code[:-2].isdigit():
+        code = code[:-2]
     matches = df[df[COL_TRACKING] == code]
+    # Запасной поиск: если точное совпадение не найдено — ищем подстроку
+    if matches.empty:
+        matches = df[df[COL_TRACKING].str.contains(code, na=False, regex=False)]
     if matches.empty:
         return None, "not_found"
 
@@ -320,6 +335,26 @@ def fmt_date(value) -> str:
         return str(value)
 
 
+def calc_arrival(sent_value, method: str) -> str:
+    """Рассчитывает примерный диапазон дат прибытия.
+    Авиа: +3-4 дня, Наземная: +7-12 дней от даты отправки.
+    """
+    try:
+        if pd.isna(sent_value) or str(sent_value).strip() in ("", "nan", "NaT"):
+            return "—"
+        sent_ts = pd.Timestamp(sent_value)
+        m = str(method).lower()
+        if "авиа" in m or "air" in m:
+            d1 = (sent_ts + pd.Timedelta(days=3)).strftime("%d.%m.%Y")
+            d2 = (sent_ts + pd.Timedelta(days=4)).strftime("%d.%m.%Y")
+        else:  # наземная доставка
+            d1 = (sent_ts + pd.Timedelta(days=7)).strftime("%d.%m.%Y")
+            d2 = (sent_ts + pd.Timedelta(days=12)).strftime("%d.%m.%Y")
+        return f"{d1} — {d2}"
+    except Exception:
+        return "—"
+
+
 def fmt_method(value) -> str:
     s = str(value).strip().lower()
     if "авиа" in s or "air" in s:
@@ -335,11 +370,13 @@ def get_val(order: dict, col: str) -> str:
 
 
 def build_reply(order: dict, header: str | None = None) -> str:
-    method = fmt_method(get_val(order, COL_METHOD))
-    sent   = fmt_date(order.get(COL_SENT))
-    client = get_val(order, COL_CLIENT)
-    desc   = get_val(order, COL_DESC)
-    notes  = get_val(order, COL_NOTES)
+    raw_method = get_val(order, COL_METHOD)
+    method     = fmt_method(raw_method)
+    sent       = fmt_date(order.get(COL_SENT))
+    arrival    = calc_arrival(order.get(COL_SENT), raw_method)
+    client     = get_val(order, COL_CLIENT)
+    desc       = get_val(order, COL_DESC)
+    notes      = get_val(order, COL_NOTES)
 
     try:
         price_str = f"💰 *Стоимость:* ${float(get_val(order, COL_PRICE)):,.2f}"
@@ -366,6 +403,8 @@ def build_reply(order: dict, header: str | None = None) -> str:
         f"📝 *Товар:* {desc}",
         price_str,
         weight_str,
+        f"📅 *Дата отправки:* {sent}",
+        f"🕐 *Примерная дата прибытия:* {arrival}",
     ]
     if notes != "—":
         lines.append(f"📌 *Примечание:* {notes}")
@@ -395,7 +434,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await update.message.reply_text(
         "📦 Пожалуйста, отправьте *трек-код* товара, чтобы получить информацию о доставке.\n\n"
-        "Пример:\n`SF1234567891011`",
+        "Примеры трек-кодов:\n"
+        "`SF1234567891011`\n"
+        "`JDK1234567890`\n"
+        "`1234567890`\n\n"
+        "Поддерживаются все форматы курьерских служб.",
         parse_mode="Markdown",
     )
 
@@ -404,8 +447,22 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "📦 *Как узнать статус доставки:*\n\n"
         "Просто отправьте ваш *трек-код* товара.\n\n"
-        "Пример:\n`SF1234567891011`\n\n"
-        "Трек-код можно найти в чеке или подтверждении заказа.",
+        "Примеры:\n"
+        "`SF1234567891011`\n"
+        "`JDK1234567890`\n"
+        "`1234567890`\n\n"
+        "Трек-код можно найти в чеке или подтверждении заказа.\n\n"
+        "🔄 Для принудительного обновления данных используйте /refresh",
+        parse_mode="Markdown",
+    )
+
+
+async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Принудительно сбрасывает кеш и перезагружает данные из Excel."""
+    _cache["result"] = None
+    _cache["ts"] = 0.0
+    await update.message.reply_text(
+        "🔄 Кеш сброшен. Данные будут обновлены при следующем запросе.",
         parse_mode="Markdown",
     )
 
@@ -470,8 +527,9 @@ async def track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     logger.info("Бот запускается…")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help",  help_cmd))
+    app.add_handler(CommandHandler("start",   start))
+    app.add_handler(CommandHandler("help",    help_cmd))
+    app.add_handler(CommandHandler("refresh", refresh_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
